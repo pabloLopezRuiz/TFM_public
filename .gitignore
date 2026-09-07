@@ -1,0 +1,10 @@
+*.h5ad*
+__pycache__
+*.venv
+*workspace*
+*.Identifier
+*_files
+
+/.quarto/
+**/*.quarto_ipynb
+

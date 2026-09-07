@@ -1,0 +1,474 @@
+---
+title: "Validation and Evaluation of the scRNA-seq Toolkit on Danio rerio"
+subtitle: "Comprehensive testing of all analytical functions on red_dr.h5ad"
+author: "Pablo López Ruiz"
+format:
+  html:
+    code-fold: show
+    lightbox: true
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  eval: true
+
+---
+
+```{=html}
+<style>
+#fig-volcano img, #fig-heatmap img {
+  max-width: 90% !important;
+  height: auto;
+  margin: 0 auto;
+  display: block;
+}
+</style>
+```
+
+# Introduction
+
+This document provides a practical demonstration of key computational methods developed during my Master's Thesis. Due to confidentiality restrictions, the primary thesis code and work cannot be publicly distributed. This notebook demonstrates the analytical pipeline used in the original single-cell dataset.
+
+The accompanying Python toolkit (`toolkit.py`) provides functions for:
+
+- Quality control and cell preprocessing
+- Dimensionality reduction and variance analysis
+- Sample and temporal distribution profiling
+- Differential expression analysis
+- Temporal expression trend modeling
+- Z-score computation based on cell-type specific expression trend
+- Clustered heatmaps
+
+Furthermore, this work demonstrates:
+
+- Proficiency in Python development
+- Deep understanding of single-cell genomics workflows and data structures (AnnData, Scanpy)
+- Statistical modeling and hypothesis testing on high-dimensional biological data
+- Advanced scientific visualizations
+
+# Analytical Pipeline
+
+## Environment Setup and Module Loading
+
+We import the required scientific libraries and our modular toolkit (`toolkit.py`).
+
+```{python}
+import os
+import gc
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import matplotlib.pyplot as plt
+import toolkit as tk
+
+plt.ioff()
+
+# Apply the publication style defined in the Master's Thesis
+tk.apply_tfm_style()
+
+# Global variables
+TF_FILE_PATH = "tf.txt"
+SUB_FILE_PATH = "tf_cell_types.pkl"
+```
+
+## Dataset Loading and Reduction (`red_dr.h5ad`)
+
+In this example we use a *Danio rerio* single-cell developmental study dataset. The following lines correspond to the reduction of the original dataset `dr.h5ad` to generate `red_dr.h5ad`, selecting essential variables from head tissue (*head*) to optimize resource usage.
+> This dataset comes from [*Duran et. al, 2025* publication](https://cellxgene.cziscience.com/collections/4ea9a90e-1dad-4c67-b1e3-8488ab7dc269)
+
+```{python}
+# adata = sc.read_h5ad("dr.h5ad")
+# del adata.obsm
+# del adata.uns
+# adata.obs = adata.obs[[
+#     "Size_Factor", 
+#     "n.umi", 
+#     "cell_type_short", 
+#     "num_genes_expressed", 
+#     "disease", 
+#     "tissue", 
+#     "development_stage"
+# ]]
+# adata.var = adata.var[[
+#     "gene_short_name", 
+#     "chromosome", 
+#     "feature_name", 
+#     "feature_type"
+# ]]
+# adata = adata[adata.obs.tissue == "head"]
+# adata.write_h5ad("red_dr.h5ad")
+
+adata = sc.read_h5ad("red_dr.h5ad")
+```
+
+## Temporal Mapping and Danio rerio Specific Annotations
+
+To test the toolkit capabilities, we need to:
+1. Map the ontological stages in `development_stage` to a continuous quantitative chronological scale (hours post-fertilization `time_hpf` and days `time_days`), following the standard *Danio rerio* developmental staging series (Kimmel et al., 1995).
+2. Identify mitochondrial genes (`is_mt`) and ribosomal genes (`is_ribo`).
+3. Annotate zebrafish transcription factor families (`is_tf`) and a subset of these factors (`is_sub`).
+
+We also create the `is_mt` and `is_ribo` columns to identify mitochondrial and ribosomal genes, respectively. Finally, a set of transcription factors and a subset of these are established for downstream analysis.
+
+> Originally we used a subset of transcription factors related to specific developmental stages, but here we use a randomly generated cell-type-specific subset to demonstrate the capabilities of the toolkit without biological significance.
+
+```{python}
+#| warning: False
+# Change adata.var index from ENSEMBL to gene short name and rm duplicates
+adata.var = adata.var.set_index("gene_short_name")
+adata = adata[:, ~adata.var.index.duplicated(keep="first")].copy()
+
+# Map developmental stages to quantitative time points
+stage_to_hpf = {
+    'segmentation:14-19 somites': 18.0,
+    'segmentation:20-25 somites': 21.0,
+    'segmentation:26+ somites': 24.0,
+    'pharyngula:prim-5': 24.0,
+    'pharyngula:prim-15': 30.0,
+    'pharyngula:prim-25': 36.0,
+    'pharyngula:high-pec': 42.0,
+    'hatching:long-pec': 48.0,
+    'hatching:pec-fin': 60.0,
+    'larval:protruding-mouth': 72.0,
+}
+adata.obs['time_hpf'] = (adata.obs['development_stage']
+.map(stage_to_hpf)
+.astype(float))
+adata.obs['time_days'] = adata.obs['time_hpf'] / 24.0
+
+# Free intermediate mapping dictionary
+stage_to_hpf = None
+gc.collect()
+
+# Identification of mitochondrial and ribosomal genes
+adata.var['is_mt'] = (adata.var.feature_type
+.astype(str)
+.str.startswith(("Mt", "MT", "mt")))
+adata.var['is_ribo'] = (adata.var.feature_type.astype(str) == "rRNA")
+
+# Load transcription factors from a file
+tf_set = set()
+with open(TF_FILE_PATH) as f:
+    for line in f.readlines():
+        line = line.strip()
+        tf_set.add(line)
+
+tf_set = tf_set.intersection(adata.var.index)
+
+adata.var['is_tf'] = adata.var.index.isin(tf_set)
+
+# Load subset of TFs (just for showing the use of the program)
+sub_dict = pd.read_pickle(SUB_FILE_PATH)
+sub_set = set().union(*sub_dict.values())
+adata.var['is_sub'] = adata.var_names.isin(sub_set)
+
+# Free intermediate set
+sub_set = None
+gc.collect()
+```
+
+## Quality Control and Preprocessing (`qc_and_preprocess`)
+
+We compute cell viability metrics, filter out low-quality cells or those with excessive mitochondrial/ribosomal content, apply library size normalization (10,000 counts), and perform `log1p` transformation.
+
+```{python}
+qc_res = tk.qc_and_preprocess(
+    adata,
+    mt_col="is_mt",
+    ribo_col="is_ribo",
+    max_mt_pct=20.0,
+    max_ribo_pct=20.0,
+    min_genes_per_cell=200,
+    min_cells_per_gene=5,
+    target_sum=1e4,
+    log_transform=True
+)
+
+print(f"Filtered cells:\n"
+      f"{qc_res['metrics']['n_cells_before']} "
+      f"-> {qc_res['metrics']['n_cells_after']}")
+print(f"Filtered genes:\n"
+      f"{qc_res['metrics']['n_genes_before']} "
+      f"-> {qc_res['metrics']['n_genes_after']}")
+```
+
+```{python}
+#| label: fig-qc-violin
+#| fig-cap: "Distribution of mitochondrial and ribosomal gene percentages per cell with quality control thresholds."
+qc_res["fig_violin"]
+```
+
+```{python}
+#| label: fig-qc-depth-pre
+#| fig-cap: "Pre-normalization sequencing depth showing detected genes versus total counts per cell."
+qc_res["fig_depth_pre"]
+```
+
+```{python}
+#| label: fig-qc-depth-post
+#| fig-cap: "Post-normalization sequencing depth following library size scaling and cell/gene filtering."
+qc_res["fig_depth_post"]
+```
+
+## Sample Distribution (`plot_sample_distributions`)
+
+We analyze cell counts across developmental days and evaluate cell density curves across cell types.
+
+```{python}
+dist_res = tk.plot_sample_distributions(
+    adata,
+    disc_key="time_days",
+    cont_key="cell_type_short",
+    p_inf=5.0,
+    p_sup=95.0
+)
+```
+
+```{python}
+#| label: fig-sample-discrete
+#| fig-cap: "Sample distribution across developmental stages (days post-fertilization)."
+dist_res['fig_disc']
+```
+
+```{python}
+#| label: fig-sample-density
+#| fig-cap: "Cell density distribution across cranial cell types, highlighting the mean and bounding percentiles."
+dist_res['fig_cont']
+```
+
+## Dimensionality Reduction (`compute_dimred`)
+
+We compute PCA (30 components), inspect the variance explained elbow plot, and generate UMAP projections colored by cell type and developmental time.
+
+```{python}
+dimred_res_cell = tk.compute_dimred(
+    adata,
+    n_pcs=30,
+    n_neighbors=15,
+    n_components_umap=2,
+    color_keys=["cell_type_short"],
+    rewrite=False
+)
+
+dimred_res_time = tk.compute_dimred(
+    adata,
+    n_pcs=30,
+    n_neighbors=15,
+    n_components_umap=2,
+    color_keys=["time_days"],
+    rewrite=False
+)
+```
+
+```{python}
+#| label: fig-pca-variance
+#| fig-cap: "Explained variance ratio per principal component from PCA."
+dimred_res_cell['fig_variance']
+```
+
+```{python}
+#| label: fig-pca-celltype
+#| fig-cap: "PCA projection of head cells colored by cell type annotation."
+dimred_res_cell['fig_pca']
+```
+
+```{python}
+#| label: fig-pca-time
+#| fig-cap: "PCA projection of head cells colored by developmental time (days post-fertilization)."
+dimred_res_time['fig_pca']
+```
+
+```{python}
+#| label: fig-umap-celltype
+#| fig-cap: "UMAP embedding of single cells colored by distinct cell type populations."
+dimred_res_cell['fig_umap']
+```
+
+```{python}
+#| label: fig-umap-time
+#| fig-cap: "UMAP embedding of single cells colored by developmental progression in days."
+dimred_res_time['fig_umap']
+```
+
+## Stratified Differential Expression Analysis (`run_stratified_dea`)
+
+We stratify development into two stages (`Late` >= 2.0 days and `Early` < 2.0 days) and evaluate differential expression within each cell type using the Wilcoxon rank-sum test.
+
+```{python}
+adata.obs['age_group'] = np.where(
+    adata.obs['time_days'] >= 2.0, 'Late', 'Early'
+)
+
+# DEA across the whole transcriptome
+dea_res = tk.run_stratified_dea(
+    adata,
+    grp_key="cell_type_short",
+    condition_key="age_group",
+    target_group="Late",
+    reference_group="Early",
+    sel_method="wilcoxon",
+    pval_thresh=0.05,
+    sub_dict=sub_dict
+)
+
+print("Global DEA summary table by cell type:")
+dea_res['summary_table']
+```
+
+```{python}
+# DEA restricted to Transcription Factors
+# (recalculates rank_genes_groups and adjusted p-values on the TF subset)
+adata_tf = adata[:, adata.var["is_tf"]].copy()
+
+dea_res_tf = tk.run_stratified_dea(
+    adata_tf,
+    grp_key="cell_type_short",
+    condition_key="age_group",
+    target_group="Late",
+    reference_group="Early",
+    sel_method="wilcoxon",
+    pval_thresh=0.05,
+    sub_dict=sub_dict
+)
+
+# Release temporary AnnData copy from memory
+adata_tf = None
+gc.collect()
+
+print("DEA summary table restricted to Transcription Factors:")
+dea_res_tf['summary_table']
+```
+
+## Scientific Volcano Plot (`plot_volcano`)
+
+We generate a volcano plot highlighting significance levels for p-values, log2 fold changes, and designated gene categories. Here we focus specifically on cranial motor neurons (`cranial motor neuron`).
+
+```{python}
+celltype = 'cranial motor neuron'
+df_volc = dea_res['dea_by_group'][celltype]
+
+volcano_res = tk.plot_volcano(
+    df_volc,
+    target_genes=sub_dict[celltype],
+    pval_col="pvals_adj",
+    lfc_col="logfoldchanges",
+    gene_label_col="common",
+    pval_thresh=0.05,
+    lfc_thresh=1.0,
+    lfc_highlight_thresh=3.0,
+    title=f"Volcano Plot - {celltype} (Late vs Early)",
+    figsize=(9, 6)
+)
+
+# Release temporary DataFrame slice from memory
+df_volc = None
+gc.collect()
+```
+
+```{python}
+#| label: fig-volcano
+#| fig-cap: "Volcano plot of differential expression for cranial motor neurons (Late vs. Early development), highlighting target transcription factors."
+#| fig-align: center
+#| out-width: 90%
+volcano_res['fig']
+```
+
+## Temporal Trends in Gene Expression (`compute_temporal_slopes`)
+
+We fit linear regression models for each gene across developmental time, categorizing them into *Target group (subset of TFs)*, *Transcription factors*, and *Rest of genes*.
+
+```{python}
+slopes_res = tk.compute_temporal_slopes(
+    adata,
+    time_key="time_days",
+    min_expressing_cells=10,
+    tf_col="is_tf",
+    sub_col="is_sub"
+)
+```
+
+```{python}
+#| label: fig-slopes-boxplot
+#| fig-cap: "Distribution of temporal expression slopes across gene categories (target TF subset, all transcription factors, and background genes)."
+slopes_res['fig_boxplot']
+```
+
+```{python}
+#| label: fig-slopes-trend
+#| fig-cap: "Median linear expression trajectories across developmental days comparing each gene category."
+slopes_res['fig_trend']
+```
+
+## Hypothesis Testing: Permutation and Mann-Whitney Tests (`run_tests`)
+
+We statistically test whether the temporal slopes of the target transcription factor subset differ significantly from the background gene distribution using 1,000 Monte Carlo permutations and the Mann-Whitney U test.
+
+```{python}
+df_slopes = slopes_res['df_slopes'].dropna(subset=['slope'])
+
+test_res = tk.run_tests(
+    col_data=df_slopes['slope'],
+    col_cat=df_slopes['cat'],
+    sel_cat=tk.SUB_NAME,
+    permutation_test=True,
+    mannwhitney_test=True,
+    n_permutations=1000,
+    alternative="two-sided"
+)
+
+# Release temporary slopes DataFrame from memory
+df_slopes = None
+gc.collect()
+
+print(f"Monte Carlo permutation p-value: {test_res['p_perm']}")
+print(f"Mann-Whitney U test p-value:     {test_res['p_mw']}")
+```
+
+```{python}
+#| label: fig-perm-dist
+#| fig-cap: "Null permutation distribution of median slopes with empirical cutoffs and observed group medians."
+test_res['fig_dist']
+```
+
+## Cell-Type Specific Slopes and Z-Scores (`compute_celltype_slopes_and_zscores`)
+
+We compute cell-type-specific temporal expression rates of change within each cell population and standardize them into Z-scores.
+
+```{python}
+ct_slopes_res = tk.compute_celltype_slopes_and_zscores(
+    adata,
+    celltype_key="cell_type_short",
+    time_key="time_days",
+    min_expressing_cells=5,
+    min_cells=10,
+    min_time=2
+)
+```
+
+## Heatmap with Highlighted Markers (`plot_heatmap_with_highlights`)
+
+We generate a heatmap of the standardized Z-scores across cell types, outlining genes from the selected TF subgroup with black borders.
+
+```{python}
+df_z = ct_slopes_res['z_scores'].dropna()
+
+heatmap_res = tk.plot_heatmap_with_highlights(
+    df=df_z,
+    celltype_gene_map=sub_dict,
+    subset_genes=list(tf_set)[1000:],
+    figsize=(12,12)
+)
+
+# Release intermediate z-score matrix and tf_set
+df_z = None
+tf_set = None
+gc.collect()
+```
+
+```{python}
+#| label: fig-heatmap
+#| fig-cap: "Heatmap of cell-type-specific temporal rate Z-scores with black borders framing selected target transcription factors."
+#| fig-align: center
+#| out-width: 90%
+heatmap_res['fig']
+```
