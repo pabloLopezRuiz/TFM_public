@@ -28,7 +28,7 @@ The repository contains:
 
 | Cell Type UMAP Projection | Permutation Test Null Distribution |
 | :---: | :---: |
-| ![UMAP of Cell Types](figures/umap_cell_types.png) | ![Permutation Test Null Distribution](figures/permutation_test_kde.png) |
+| ![UMAP of Cell Types](example_figures/umap_cell_types.png) | ![Permutation Test Null Distribution](example_figures/permutation_test_kde.png) |
 | *Single-cell UMAP projection colored by annotated cranial cell populations.* | *Monte Carlo permutation test comparing temporal slopes against randomized null distribution.* |
 
 ---
